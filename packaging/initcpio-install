@@ -1,0 +1,31 @@
+# Hook de mkinitcpio para vasak-splash. Se instala en
+# /usr/lib/initcpio/install/vasak-splash; mkinitcpio lo corre al armar el
+# initramfs para decidir qué meter adentro.
+#
+# Modelado sobre el de plymouth, pero mucho más chico: el logo va embebido en el
+# binario, así que no hay tema, ni fuentes, ni módulos de render que copiar. Un
+# solo binario y el script de arranque.
+
+build() {
+    # El binario del daemon. Enlaza sólo glibc y gcc-libs (auditado con
+    # `readelf -d`), que `add_binary` arrastra solo.
+    add_binary '/usr/bin/vasak-splashd'
+
+    # La configuración, si existe: así el color de fondo se respeta ya en el
+    # initramfs y no sólo una vez montado el sistema.
+    if [ -f /etc/vasak-splash.conf ]; then
+        add_file '/etc/vasak-splash.conf'
+    fi
+
+    # El script que arranca el daemon al correr el hook.
+    add_runscript
+}
+
+help() {
+    cat <<HELPEOF
+Mete el splash de arranque de VasakOS (vasak-splash) en el initramfs. El daemon
+toma el DRM apenas el hook `kms` cargó el driver de modesetting, dibuja el logo
+sobre un fondo sólido y se retira cuando el greeter le manda `quit`. Va después
+de `kms` en el array de HOOKS.
+HELPEOF
+}

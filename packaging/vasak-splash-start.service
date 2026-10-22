@@ -1,0 +1,26 @@
+# Camino alternativo al del initramfs: arrancar el splash en el sistema real,
+# antes del greeter. Se entrega **apagado** —el mecanismo principal de la Fase 1
+# es el hook de initramfs, que dibuja mucho antes—, y está acá para dos cosas:
+# documentar el punto de orden con greetd, y servir de cobertura en una máquina
+# donde el camino de initramfs no se use.
+#
+# No encender los dos a la vez: dos `vasak-splashd` peleándose por el master del
+# DRM es exactamente lo que no queremos.
+
+[Unit]
+Description=Splash de arranque de VasakOS (hueco boot→greeter)
+Documentation=https://github.com/Vasak-OS/vasak-splash
+# Tiene que levantar en el arranque temprano, sin la maraña de dependencias por
+# omisión, y antes de que el greeter tome la pantalla.
+DefaultDependencies=no
+After=systemd-udevd.service
+Before=greetd.service
+
+[Service]
+# `exec`: listo apenas se ejecuta el binario. greetd, ordenado después, no espera
+# a que termine —el daemon vive hasta el `quit`—.
+Type=exec
+ExecStart=/usr/bin/vasak-splashd start
+
+[Install]
+WantedBy=graphical.target

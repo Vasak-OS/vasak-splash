@@ -1,0 +1,5 @@
+# El grupo dueño del socket de control (/run/vasak-splash.sock, 0660
+# root:vasak-splash). El daemon corre como root y crea el socket; el greeter,
+# que corre como el usuario `greeter`, le manda `quit` —y para eso tiene que
+# estar en este grupo, cosa que se cablea al integrar el greeter (seguimiento)—.
+g vasak-splash -
