@@ -101,22 +101,15 @@ fn start() -> ExitCode {
         &mut backoff,
     );
 
+    // La decisión «¿restaurar el vt?» es pura y vive en `Outcome` para poder
+    // fijarla con una prueba; la restauración en sí toca /dev/tty0 y queda acá.
+    if outcome.restores_text_mode() {
+        drm_backend::set_text_mode();
+    }
+
     match outcome {
-        // Handoff: el greeter toma el scanout en modo gráfico; dejar el último
-        // frame hasta su modeset es correcto, no se restaura el vt.
-        Outcome::Handoff => ExitCode::SUCCESS,
-        // Timeout sin handoff: nadie toma la pantalla. Devolver la consola a
-        // modo texto para no dejarla en negro.
-        Outcome::TimedOut => {
-            drm_backend::set_text_mode();
-            ExitCode::SUCCESS
-        }
-        // No se pudo tomar el DRM: `open()` ya había puesto el vt en modo
-        // gráfico, así que hay que restaurarlo al salir.
-        Outcome::GaveUp => {
-            drm_backend::set_text_mode();
-            ExitCode::FAILURE
-        }
+        Outcome::Handoff | Outcome::TimedOut => ExitCode::SUCCESS,
+        Outcome::GaveUp => ExitCode::FAILURE,
     }
 }
 

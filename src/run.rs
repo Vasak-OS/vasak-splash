@@ -28,6 +28,21 @@ pub enum Outcome {
     GaveUp,
 }
 
+impl Outcome {
+    /// Si al terminar con este `Outcome` hay que devolver la consola a modo
+    /// texto (`KD_TEXT`). Sólo el handoff deja el vt en modo gráfico: el greeter
+    /// toma el scanout. El timeout y el abandono salen sin que nadie dibuje, así
+    /// que restauran para no dejar la pantalla en negro ocultando el arranque.
+    /// Decisión pura y sin hardware a propósito —la restauración en sí toca
+    /// `/dev/tty0` y queda en `main`—, para poder fijarla con una prueba.
+    pub fn restores_text_mode(self) -> bool {
+        match self {
+            Outcome::Handoff => false,
+            Outcome::TimedOut | Outcome::GaveUp => true,
+        }
+    }
+}
+
 /// La función de dibujo que recibe `with_frame`: los bytes del buffer, su stride
 /// y el ancho y alto en píxeles.
 pub type DrawFn<'a> = dyn FnMut(&mut [u8], usize, u32, u32) + 'a;
