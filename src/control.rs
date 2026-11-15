@@ -104,3 +104,81 @@ pub fn send(path: &str, command: &str) -> std::io::Result<()> {
     writeln!(stream, "{command}")?;
     stream.flush()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn quit_y_resume_se_reconocen() {
+        assert_eq!(parse_command("quit"), Some(Command::Quit));
+        assert_eq!(parse_command("resume"), Some(Command::Resume));
+    }
+
+    #[test]
+    fn se_ignoran_espacios_saltos_de_linea_y_mayusculas() {
+        assert_eq!(parse_command("  QuIt \r\n"), Some(Command::Quit));
+        assert_eq!(parse_command("RESUME\n"), Some(Command::Resume));
+    }
+
+    #[test]
+    fn lo_desconocido_vacio_o_con_argumentos_no_es_una_orden() {
+        for malo in [
+            "",
+            "   ",
+            "\n",
+            "exit",
+            "quit now",
+            "quit\nresume",
+            "qui",
+            "quitt",
+            "\0quit",
+        ] {
+            assert_eq!(parse_command(malo), None, "entrada: {malo:?}");
+        }
+    }
+
+    #[test]
+    fn una_linea_enorme_no_hace_panico() {
+        let enorme = "a".repeat(1 << 20);
+        assert_eq!(parse_command(&enorme), None);
+        assert_eq!(parse_command(&"é".repeat(1000)), None);
+    }
+
+    #[test]
+    fn por_el_socket_llega_la_orden_enviada() {
+        let dir = std::env::temp_dir().join(format!("vasak-splash-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("c.sock");
+        let path = sock.to_str().unwrap();
+        let (tx, rx) = mpsc::channel();
+        serve(path, tx).unwrap();
+
+        send(path, "quit").unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(Command::Quit));
+        // Una orden basura no llega, y el servidor sigue atendiendo.
+        send(path, "basura").unwrap();
+        send(path, "resume").unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(Command::Resume));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enviar_sin_daemon_escuchando_da_error() {
+        assert!(send("/nonexistent-dir/vasak-splash.sock", "quit").is_err());
+    }
+
+    #[test]
+    fn serve_reemplaza_un_socket_viejo() {
+        let dir = std::env::temp_dir().join(format!("vasak-splash-viejo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("v.sock");
+        std::fs::write(&sock, b"resto de un arranque anterior").unwrap();
+        let (tx, _rx) = mpsc::channel();
+        assert!(serve(sock.to_str().unwrap(), tx).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

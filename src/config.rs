@@ -70,3 +70,103 @@ pub fn parse(text: &str) -> Config {
     }
     config
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn el_texto_vacio_da_la_configuracion_por_omision() {
+        assert_eq!(parse(""), Config::default());
+        assert_eq!(parse("\n\n  \n"), Config::default());
+    }
+
+    #[test]
+    fn los_valores_validos_pisan_los_de_omision() {
+        let c = parse("background=#112233\ntimeout_ms=1500\n");
+        assert_eq!(c.background, 0x0011_2233);
+        assert_eq!(c.timeout, Duration::from_millis(1500));
+    }
+
+    #[test]
+    fn los_espacios_alrededor_de_clave_y_valor_se_ignoran() {
+        let c = parse("  background  =  ff0000  \n\ttimeout_ms = 5 ");
+        assert_eq!(c.background, 0x00ff_0000);
+        assert_eq!(c.timeout, Duration::from_millis(5));
+    }
+
+    #[test]
+    fn los_comentarios_y_las_claves_desconocidas_se_ignoran() {
+        let c = parse("# background=#ffffff\nlogo=grande\ntimeout_ms=100\n");
+        assert_eq!(c.background, DEFAULT_BACKGROUND);
+        assert_eq!(c.timeout, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn las_lineas_sin_igual_se_ignoran() {
+        assert_eq!(parse("background\nbasura sin igual"), Config::default());
+    }
+
+    #[test]
+    fn un_color_malformado_conserva_el_de_omision() {
+        for malo in [
+            "", "#12345", "#1234567", "gggggg", "#12 456", "##123456", "+12345",
+        ] {
+            let c = parse(&format!("background={malo}"));
+            assert_eq!(c.background, DEFAULT_BACKGROUND, "entrada: {malo:?}");
+        }
+    }
+
+    #[test]
+    fn un_timeout_invalido_conserva_el_de_omision() {
+        for malo in ["", "abc", "-1", "1.5", "99999999999999999999999"] {
+            let c = parse(&format!("timeout_ms={malo}"));
+            assert_eq!(c.timeout, DEFAULT_TIMEOUT, "entrada: {malo:?}");
+        }
+    }
+
+    #[test]
+    fn un_valor_invalido_no_afecta_a_las_demas_claves() {
+        let c = parse("background=zzz\ntimeout_ms=250");
+        assert_eq!(c.background, DEFAULT_BACKGROUND);
+        assert_eq!(c.timeout, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn si_una_clave_se_repite_gana_la_ultima_valida() {
+        let c = parse("background=#111111\nbackground=#222222\nbackground=roto");
+        assert_eq!(c.background, 0x0022_2222);
+    }
+
+    #[test]
+    fn el_valor_puede_contener_otro_igual_sin_romper_el_parseo() {
+        assert_eq!(parse("background==#123456").background, DEFAULT_BACKGROUND);
+    }
+
+    #[test]
+    fn parse_color_acepta_con_y_sin_almohadilla_y_mayusculas() {
+        assert_eq!(parse_color("#1E1E2E"), Some(0x001e_1e2e));
+        assert_eq!(parse_color("1e1e2e"), Some(0x001e_1e2e));
+        assert_eq!(parse_color("  #000000 "), Some(0));
+        assert_eq!(parse_color("#FFFFFF"), Some(0x00ff_ffff));
+    }
+
+    #[test]
+    fn parse_color_rechaza_unicode_sin_panico() {
+        // Seis bytes que no son seis dígitos hex (dos caracteres de tres bytes).
+        assert_eq!(parse_color("日本"), None);
+        assert_eq!(parse_color("é"), None);
+    }
+
+    #[test]
+    fn el_timeout_cero_se_acepta_tal_cual() {
+        // Documenta el comportamiento actual: no hay piso para el timeout.
+        assert_eq!(parse("timeout_ms=0").timeout, Duration::ZERO);
+    }
+
+    #[test]
+    fn una_entrada_enorme_no_hace_panico() {
+        let basura = "x=".repeat(200_000) + &"\n=\n".repeat(10_000);
+        assert_eq!(parse(&basura), Config::default());
+    }
+}
