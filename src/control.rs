@@ -2,7 +2,7 @@
 //! `/run/vasak-splash.sock`; un `vasak-splashd quit` se conecta y escribe una
 //! línea. El parseo está separado del socket para poder probarlo sin red.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -57,9 +57,18 @@ pub fn serve(path: &str, tx: Sender<Command>) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Lee la primera línea de una conexión y la parsea.
+/// El protocolo son 4-6 bytes; 1 KiB es tope de sobra. Acota la lectura para que
+/// un par con acceso al socket (grupo `vasak-splash`) no haga crecer la memoria
+/// del daemon mandando bytes sin `\n`.
+const MAX_COMMAND_BYTES: u64 = 1024;
+
+/// Lee la primera línea de una conexión y la parsea. La lectura está acotada en
+/// bytes y en tiempo: un par que escribe sin `\n` no infla la memoria ni cuelga
+/// el hilo de accept secuencial. Lo que excede el tope o no es una línea válida
+/// cae en `parse_command` como entrada desconocida y devuelve `None`, sin pánico.
 fn read_command(stream: UnixStream) -> Option<Command> {
-    let mut reader = BufReader::new(stream);
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    let mut reader = BufReader::new(stream.take(MAX_COMMAND_BYTES));
     let mut line = String::new();
     reader.read_line(&mut line).ok()?;
     parse_command(&line)
