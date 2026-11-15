@@ -1,0 +1,12 @@
+# Hook de arranque de vasak-splash. Se instala en
+# /usr/lib/initcpio/hooks/vasak-splash y corre dentro del initramfs, en cada
+# arranque, en el orden del array de HOOKS (después de `kms`).
+
+run_hook() {
+    # En segundo plano: el hook tiene que volver para que el arranque siga, y el
+    # daemon se queda dibujando. Sobrevive al `switch_root` igual que plymouthd
+    # —sus páginas ya están mapeadas— y se retira cuando el greeter le manda
+    # `quit` por el socket de /run. (Que sobreviva el switch_root y que el socket
+    # siga alcanzable desde el sistema real se valida en VM/hardware.)
+    /usr/bin/vasak-splashd start &
+}

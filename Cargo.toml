@@ -1,0 +1,45 @@
+# vasak-splash — el splash de arranque de VasakOS.
+#
+# Un solo crate, sin workspace: no hay contrato que un segundo repositorio
+# necesite importar (como sí pasa en vasak-health-service), así que partir el
+# daemon del protocolo sólo agregaría ceremonia.
+[package]
+name = "vasak-splash"
+version = "0.1.0"
+edition = "2021"
+authors = ["Vasak Group", "Joaquin (Pato) Decima"]
+license = "GPL-3.0-or-later"
+description = "Splash de arranque propio de VasakOS: dibuja el logo sobre DRM con dumb buffers, sin plymouth"
+repository = "https://github.com/Vasak-OS/vasak-splash"
+
+# El binario se llama `vasak-splashd` —un daemon— aunque el paquete sea
+# `vasak-splash`, igual que el resto de los servicios del taller.
+[[bin]]
+name = "vasak-splashd"
+path = "src/main.rs"
+
+[dependencies]
+# Acceso a KMS/DRM en Rust puro: no enlaza libdrm, hace los ioctls él mismo. Por
+# eso el binario sólo termina enlazando glibc (auditado con `readelf -d`).
+drm = "0.15"
+# El fourcc del formato de los dumb buffers (XRGB8888).
+drm-fourcc = "2.2"
+# Para los pocos syscalls crudos del camino real de DRM que drm-rs no cubre: el
+# ioctl KDSETMODE que pone el vt en modo gráfico (invariante anti-parpadeo).
+# Enlaza glibc, que el binario ya enlaza; no agrega ninguna .so nueva.
+libc = "0.2"
+
+[build-dependencies]
+# Sólo en tiempo de compilación: el logo se rasteriza a RGBA crudo en `build.rs`
+# y se embebe con `include_bytes!`, así que en ejecución no hay ninguna
+# dependencia de imagen.
+png = "0.18"
+
+# El perfil de publicación busca el binario más chico posible: es lo que viaja
+# en el initramfs, donde cada KiB se descomprime en cada arranque.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

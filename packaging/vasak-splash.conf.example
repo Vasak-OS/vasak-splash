@@ -1,0 +1,12 @@
+# Configuración de vasak-splash. Todas las claves son opcionales; sin este
+# archivo, el daemon usa los valores por omisión. Se instala como
+# /etc/vasak-splash.conf.
+
+# Color de fondo, #RRGGBB. Por omisión el fondo del esquema de fábrica de
+# VasakOS. Más adelante va a salir del esquema que elija quien usa el sistema.
+#background = #1e1e2e
+
+# Tope del temporizador de seguridad, en milisegundos. Si el `quit` del greeter
+# no llega en este tiempo, el daemon se retira solo para no dejar la pantalla
+# colgada. Por omisión 20000 (20 s).
+#timeout_ms = 20000
