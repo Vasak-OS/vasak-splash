@@ -204,3 +204,18 @@ impl CommandSource for ChannelSource {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn solo_el_handoff_deja_el_vt_en_modo_grafico() {
+        // El handoff entrega el scanout al greeter: restaurar texto lo pisaría.
+        assert!(!Outcome::Handoff.restores_text_mode());
+        // Timeout y abandono salen sin que nadie dibuje: sin restaurar a texto la
+        // consola queda en negro.
+        assert!(Outcome::TimedOut.restores_text_mode());
+        assert!(Outcome::GaveUp.restores_text_mode());
+    }
+}

@@ -117,6 +117,7 @@ pub fn send(path: &str, command: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -172,6 +173,32 @@ mod tests {
         send(path, "resume").unwrap();
         assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(Command::Resume));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn un_cliente_que_manda_mas_del_tope_sin_salto_de_linea_no_entrega_orden_ni_traba_el_servidor()
+    {
+        let dir = std::env::temp_dir().join(format!("vasak-splash-tope-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("t.sock");
+        let path = sock.to_str().unwrap();
+        let (tx, rx) = mpsc::channel();
+        serve(path, tx).unwrap();
+
+        // 4 KiB sin `\n` y la conexión abierta: sin tope el servidor se queda
+        // esperando el fin de línea y no atiende a nadie más.
+        let mut abusivo = UnixStream::connect(path).unwrap();
+        abusivo.write_all(&[b'a'; 4096]).unwrap();
+
+        send(path, "quit").unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(3)), Ok(Command::Quit));
+        assert!(
+            rx.try_recv().is_err(),
+            "el cliente abusivo no debe entregar ninguna orden"
+        );
+
+        drop(abusivo);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
