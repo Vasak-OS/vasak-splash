@@ -79,6 +79,9 @@ fn start() -> ExitCode {
     let (tx, rx) = mpsc::channel();
     if let Err(err) = control::serve(control::SOCKET_PATH, tx) {
         eprintln!("vasak-splashd: no se pudo abrir el socket de control: {err}");
+        // `open()` ya dejó el vt en modo gráfico: sin nadie que dibuje, hay que
+        // devolver la consola a modo texto.
+        drm_backend::set_text_mode();
         return ExitCode::FAILURE;
     }
 
@@ -99,10 +102,21 @@ fn start() -> ExitCode {
     );
 
     match outcome {
-        // En el handoff y en el timeout ya se soltó el DRM; salir deja el último
-        // frame hasta que el entrante haga su modeset.
-        Outcome::Handoff | Outcome::TimedOut => ExitCode::SUCCESS,
-        Outcome::GaveUp => ExitCode::FAILURE,
+        // Handoff: el greeter toma el scanout en modo gráfico; dejar el último
+        // frame hasta su modeset es correcto, no se restaura el vt.
+        Outcome::Handoff => ExitCode::SUCCESS,
+        // Timeout sin handoff: nadie toma la pantalla. Devolver la consola a
+        // modo texto para no dejarla en negro.
+        Outcome::TimedOut => {
+            drm_backend::set_text_mode();
+            ExitCode::SUCCESS
+        }
+        // No se pudo tomar el DRM: `open()` ya había puesto el vt en modo
+        // gráfico, así que hay que restaurarlo al salir.
+        Outcome::GaveUp => {
+            drm_backend::set_text_mode();
+            ExitCode::FAILURE
+        }
     }
 }
 
