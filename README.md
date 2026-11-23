@@ -95,4 +95,10 @@ comprobar en VM y en equipo real:
   SET_MASTER del entrante; vt en modo gráfico de punta a punta);
 - que la **cooperación con el cambio de VT** (`src/vt.rs`) funcione en consola
   real: con el splash arriba, cambiar a otra consola (Ctrl+Alt+F2) tiene que
-  soltar el master y mostrar el getty, y volver tiene que retomarlo y redibujar.
+  soltar el master y mostrar el getty, y volver tiene que retomarlo y redibujar;
+- que, **al vencer el temporizador o rendirse estando en otra consola**, se
+  restaure el modo texto del VT del splash y no del que esté al frente (la consola
+  se fija con `VT_GETSTATE`/`/dev/ttyN`, no con el flotante `/dev/tty0`), y que al
+  volver al VT del splash no quede ni negro ni en `VT_PROCESS` colgado;
+- que un **cambio de VT rápido de ida y vuelta** no deje al splash robándole la
+  pantalla al getty: el redibujo que quedó viejo tiene que descartarse.

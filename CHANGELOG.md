@@ -7,7 +7,11 @@ Todas las novedades de este repositorio, por paquete.
 - El splash ahora coopera con el cambio de consola (VT): pone el vt en
   `VT_PROCESS` y, en cada cambio, suelta el master del DRM antes de ceder la
   pantalla y lo retoma al volver. Sin esto, mientras el splash estaba arriba
-  ningún TTY se dibujaba —se perdía el acceso a la consola—.
+  ningún TTY se dibujaba —se perdía el acceso a la consola—. La consola se fija a
+  su propio VT (no al flotante `/dev/tty0`), así que restaurar el modo texto y el
+  `VT_SETMODE` caen sobre el VT del splash aunque el usuario haya cambiado de
+  consola; y un redibujo que quedó viejo tras otro cambio de VT se descarta en vez
+  de volver a tomar el master y robarle la pantalla al getty entrante.
 - El logo embebido es el de VasakOS (el lince), no el de Tauri que venía por
   error en el asset.
 

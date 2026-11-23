@@ -9,6 +9,7 @@
 //!    negro;
 //!  - nadie hace DPMS-off ni un modeset nulo en el medio.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
@@ -120,6 +121,7 @@ pub fn run<B, C, S>(
     background: u32,
     timeout: Duration,
     backoff: &mut dyn FnMut(),
+    foreground: &AtomicBool,
 ) -> Outcome
 where
     B: Backend,
@@ -147,13 +149,21 @@ where
                     backend.release();
                     return Outcome::Handoff;
                 }
-                Some(Command::Resume) => {
-                    // Fase 2: el entrante soltó el DRM; redibujamos y seguimos.
-                    // Es un stub razonable hasta que exista el hueco 2 completo.
+                // Redibujar sólo si seguimos al frente. Un `Resume` lo encola el
+                // hilo de VT al volver a la consola, pero puede quedar viejo: si
+                // entre que se encoló y lo atendemos hubo otro cambio de VT, el
+                // master ya es de otro —re-tomarlo acá le robaría la pantalla al
+                // getty entrante—. La bandera, que el hilo baja antes de soltar el
+                // master, cierra esa carrera (queda una ventana mínima entre el
+                // chequeo y el acquire, que el DROP_MASTER del hilo tapa).
+                // Fase 2: el entrante soltó el DRM; redibujamos y seguimos.
+                Some(Command::Resume) if foreground.load(Ordering::Acquire) => {
                     let _ = backend.acquire();
                     draw(backend, background);
                     let _ = backend.present();
                 }
+                // `Resume` viejo (ya no estamos al frente): descartarlo.
+                Some(Command::Resume) => {}
                 // Venció la espera sin orden: lo trata el `checked_sub` de arriba
                 // en la próxima vuelta, que devuelve `None` y retira.
                 None => {}
@@ -208,6 +218,97 @@ impl CommandSource for ChannelSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Event {
+        Acquire,
+        Release,
+        Draw,
+        Present,
+    }
+
+    #[derive(Default)]
+    struct FakeBackend {
+        events: Vec<Event>,
+    }
+
+    impl Backend for FakeBackend {
+        fn acquire(&mut self) -> std::io::Result<()> {
+            self.events.push(Event::Acquire);
+            Ok(())
+        }
+        fn release(&mut self) {
+            self.events.push(Event::Release);
+        }
+        fn with_frame(&mut self, _draw: &mut DrawFn<'_>) {
+            self.events.push(Event::Draw);
+        }
+        fn present(&mut self) -> std::io::Result<()> {
+            self.events.push(Event::Present);
+            Ok(())
+        }
+    }
+
+    struct ZeroClock;
+    impl Clock for ZeroClock {
+        fn elapsed(&self) -> Duration {
+            Duration::ZERO
+        }
+    }
+
+    struct Script(VecDeque<Command>);
+    impl CommandSource for Script {
+        fn wait(&mut self, _timeout: Duration) -> Option<Command> {
+            // El guion siempre termina en `Quit`, así que nunca se agota.
+            self.0.pop_front()
+        }
+    }
+
+    /// Corre el lazo con el guion dado y devuelve cómo terminó y qué hizo el backend.
+    fn correr(foreground: bool, guion: Vec<Command>) -> (Outcome, Vec<Event>) {
+        let mut backend = FakeBackend::default();
+        let mut source = Script(guion.into());
+        let outcome = run(
+            &mut backend,
+            &ZeroClock,
+            &mut source,
+            0,
+            Duration::from_secs(60),
+            &mut || {},
+            &AtomicBool::new(foreground),
+        );
+        (outcome, backend.events)
+    }
+
+    #[test]
+    fn un_resume_viejo_no_redibuja_ni_retoma_el_master_si_ya_no_estamos_al_frente() {
+        let (outcome, events) = correr(false, vec![Command::Resume, Command::Quit]);
+        assert_eq!(outcome, Outcome::Handoff);
+        // Sólo el arranque: acquire + draw + present, y el release del handoff.
+        assert_eq!(
+            events,
+            vec![Event::Acquire, Event::Draw, Event::Present, Event::Release]
+        );
+    }
+
+    #[test]
+    fn un_resume_al_frente_retoma_el_master_y_redibuja() {
+        let (outcome, events) = correr(true, vec![Command::Resume, Command::Quit]);
+        assert_eq!(outcome, Outcome::Handoff);
+        assert_eq!(
+            events,
+            vec![
+                Event::Acquire,
+                Event::Draw,
+                Event::Present,
+                Event::Acquire,
+                Event::Draw,
+                Event::Present,
+                Event::Release,
+            ]
+        );
+    }
 
     #[test]
     fn solo_el_handoff_deja_el_vt_en_modo_grafico() {

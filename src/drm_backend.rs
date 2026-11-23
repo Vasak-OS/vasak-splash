@@ -198,24 +198,21 @@ fn set_graphics_mode() {
     }
 }
 
-/// Devuelve el vt a modo texto con `KDSETMODE`/`KD_TEXT` sobre `/dev/tty0`, el
-/// espejo de `set_graphics_mode`. Se llama en los caminos de salida **sin**
-/// handoff (GaveUp, TimedOut, y el fallo al abrir el socket) para no dejar la
-/// consola en negro ocultando los errores de arranque. En el handoff no se
-/// llama: el greeter toma el scanout en modo gráfico. Como `panic = "abort"`
-/// impide que un `Drop` corra en el unwind, la restauración es explícita en
-/// esos caminos, no vía guard. Best-effort: cualquier error se ignora.
-pub fn set_text_mode() {
+/// Devuelve el vt a modo texto con `KDSETMODE`/`KD_TEXT`, el espejo de
+/// `set_graphics_mode`. Se llama en los caminos de salida **sin** handoff (GaveUp,
+/// TimedOut, y el fallo al abrir el socket) para no dejar la consola en negro
+/// ocultando los errores de arranque. En el handoff no se llama: el greeter toma
+/// el scanout en modo gráfico. Como `panic = "abort"` impide que un `Drop` corra
+/// en el unwind, la restauración es explícita en esos caminos, no vía guard.
+///
+/// Recibe el fd de **nuestra** consola (el de `vt::open_console`, fijo a nuestro
+/// VT), no reabre `/dev/tty0`: ese es flotante y restauraría el VT que esté al
+/// frente, no el nuestro, si el usuario cambió de consola. Best-effort: cualquier
+/// error se ignora.
+pub fn set_text_mode(tty: std::os::unix::io::RawFd) {
     const KDSETMODE: libc::c_ulong = 0x4B3A;
     const KD_TEXT: libc::c_long = 0x00;
-    if let Ok(tty) = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(Path::new("/dev/tty0"))
-    {
-        use std::os::unix::io::AsRawFd;
-        unsafe {
-            libc::ioctl(tty.as_raw_fd(), KDSETMODE, KD_TEXT);
-        }
+    unsafe {
+        libc::ioctl(tty, KDSETMODE, KD_TEXT);
     }
 }

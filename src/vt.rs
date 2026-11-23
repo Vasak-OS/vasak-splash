@@ -18,14 +18,18 @@
 //! que sólo la decisión señal→acción (`action_for_signal`) queda detrás de una
 //! función pura.
 
+use std::fs::OpenOptions;
 use std::io;
 use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::Arc;
 use std::thread;
 
 use crate::control::Command;
 
 // <linux/vt.h>
+const VT_GETSTATE: libc::c_ulong = 0x5603;
 const VT_SETMODE: libc::c_ulong = 0x5602;
 const VT_RELDISP: libc::c_ulong = 0x5605;
 const VT_AUTO: libc::c_char = 0x00;
@@ -46,6 +50,41 @@ struct VtMode {
     relsig: libc::c_short,
     acqsig: libc::c_short,
     frsig: libc::c_short,
+}
+
+#[repr(C)]
+struct VtStat {
+    v_active: libc::c_ushort,
+    v_signal: libc::c_ushort,
+    v_state: libc::c_ushort,
+}
+
+/// Abre la consola del splash **fijada a su VT**. `/dev/tty0` es flotante —apunta
+/// siempre al VT activo del momento—, así que poner o quitar el modo gráfico o el
+/// `VT_SETMODE` a través de él caen sobre el VT que esté al frente, no sobre el
+/// nuestro: si el usuario cambió de consola, restauraríamos el VT equivocado y el
+/// nuestro quedaría en modo gráfico o en `VT_PROCESS` colgado —pantalla negra al
+/// volver—. Por eso resolvemos el VT activo al arrancar, cuando el nuestro sí
+/// está al frente, con `VT_GETSTATE`, y abrimos `/dev/ttyN`. Si algo falla, se cae
+/// al `/dev/tty0` ya abierto —best-effort, como el resto del camino de DRM—.
+pub fn open_console() -> Option<OwnedFd> {
+    let tty0 = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty0")
+        .ok()?;
+    let mut st: VtStat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::ioctl(tty0.as_raw_fd(), VT_GETSTATE, &mut st) } < 0 {
+        return Some(OwnedFd::from(tty0));
+    }
+    match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(format!("/dev/tty{}", st.v_active))
+    {
+        Ok(f) => Some(OwnedFd::from(f)),
+        Err(_) => Some(OwnedFd::from(tty0)),
+    }
 }
 
 /// Qué hacer ante una señal del kernel sobre el VT. Pura y sin hardware a
@@ -94,12 +133,20 @@ pub fn block_switch_signals() {
 }
 
 /// Pone el VT en `VT_PROCESS` (el kernel nos señala los cambios) y lanza el hilo
-/// que los atiende. `tty` es el fd de la consola (`/dev/tty0`); `card`, un dup
-/// del fd de la GPU para soltar/retomar el master; `tx`, el canal del lazo, por
-/// donde se pide el redibujo al volver. Si el `VT_SETMODE` falla (sin consola
-/// real, p. ej. en desarrollo), devuelve el error y el daemon sigue sin
-/// cooperación de VT —como el resto del camino de DRM, es best-effort—.
-pub fn install(tty: RawFd, card: OwnedFd, tx: Sender<Command>) -> io::Result<()> {
+/// que los atiende. `tty` es el fd de nuestra consola (el de `open_console`, fijo
+/// a nuestro VT); `card`, un dup del fd de la GPU para soltar/retomar el master;
+/// `tx`, el canal del lazo, por donde se pide el redibujo al volver; `foreground`,
+/// la bandera compartida con el lazo que dice si el splash está al frente, para
+/// que descarte los `Resume` que quedaron viejos tras otro cambio de consola. Si
+/// el `VT_SETMODE` falla (sin consola real, p. ej. en desarrollo), devuelve el
+/// error y el daemon sigue sin cooperación de VT —como el resto del camino de DRM,
+/// es best-effort—.
+pub fn install(
+    tty: RawFd,
+    card: OwnedFd,
+    tx: Sender<Command>,
+    foreground: Arc<AtomicBool>,
+) -> io::Result<()> {
     set_process_mode(tty)?;
 
     let set = switch_sigset();
@@ -132,14 +179,21 @@ pub fn install(tty: RawFd, card: OwnedFd, tx: Sender<Command>) -> io::Result<()>
             }
             match action_for_signal(info.ssi_signo as i32) {
                 VtAction::Release => {
-                    // Soltar el master ANTES de permitir el cambio: así el kernel
-                    // puede dar la pantalla al VT entrante (un getty en texto).
+                    // Marcar que ya no estamos al frente ANTES de soltar el master:
+                    // así un `Resume` viejo que el lazo todavía no atendió se
+                    // descarta en vez de re-tomar el master y robarle la pantalla al
+                    // VT entrante. Después soltar el master, para que el kernel pueda
+                    // dar la pantalla al VT entrante (un getty en texto).
+                    foreground.store(false, Ordering::Release);
                     drop_master(card_fd);
                     reldisp(tty, VT_RELDISP_ALLOW);
                 }
                 VtAction::Acquire => {
                     reldisp(tty, VT_ACKACQ);
                     set_master(card_fd);
+                    // Volvimos al frente: marcarlo antes de pedir el redibujo, para
+                    // que el lazo no lo descarte por el chequeo de arriba.
+                    foreground.store(true, Ordering::Release);
                     // El lazo redibuja al recibir Resume (reusa el hueco Fase 2).
                     // Si el lazo ya terminó, el canal está cerrado: nada que hacer.
                     if tx.send(Command::Resume).is_err() {
