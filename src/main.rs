@@ -16,7 +16,9 @@ mod logo;
 mod render;
 mod run;
 mod select;
+mod vt;
 
+use std::os::unix::io::AsRawFd;
 use std::process::ExitCode;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -66,6 +68,11 @@ fn start() -> ExitCode {
         .map(|text| config::parse(&text))
         .unwrap_or_default();
 
+    // Bloquear las señales de cambio de VT antes de crear ningún hilo (el del
+    // socket incluido): tienen que llegar sólo por el signalfd del hilo de VT, no
+    // matar el proceso.
+    vt::block_switch_signals();
+
     let mut backend = match drm_backend::DrmBackend::open() {
         Ok(backend) => backend,
         Err(err) => {
@@ -77,12 +84,32 @@ fn start() -> ExitCode {
     };
 
     let (tx, rx) = mpsc::channel();
-    if let Err(err) = control::serve(control::SOCKET_PATH, tx) {
+    if let Err(err) = control::serve(control::SOCKET_PATH, tx.clone()) {
         eprintln!("vasak-splashd: no se pudo abrir el socket de control: {err}");
         // `open()` ya dejó el vt en modo gráfico: sin nadie que dibuje, hay que
         // devolver la consola a modo texto.
         drm_backend::set_text_mode();
         return ExitCode::FAILURE;
+    }
+
+    // Cooperar con el cambio de consola: sin esto el splash se queda con el master
+    // del DRM y el vt en modo gráfico, así que mientras está arriba ningún TTY se
+    // dibuja —te quedás sin consola—. Best-effort: si no hay consola real (p. ej.
+    // en desarrollo), el daemon sigue igual, sólo sin cooperación.
+    let tty = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty0")
+        .ok();
+    if let Some(tty) = &tty {
+        match backend.clone_card_fd() {
+            Ok(card_fd) => {
+                if let Err(err) = vt::install(tty.as_raw_fd(), card_fd, tx) {
+                    eprintln!("vasak-splashd: sin cooperación de cambio de VT: {err}");
+                }
+            }
+            Err(err) => eprintln!("vasak-splashd: no se pudo duplicar el fd de la GPU: {err}"),
+        }
     }
 
     let clock = run::MonotonicClock::default();
@@ -100,6 +127,12 @@ fn start() -> ExitCode {
         config.timeout,
         &mut backoff,
     );
+
+    // Devolver el VT a modo automático antes de salir: el greeter y los gettys
+    // tienen que poder cambiar de consola sin un daemon que ya no está.
+    if let Some(tty) = &tty {
+        vt::restore(tty.as_raw_fd());
+    }
 
     // La decisión «¿restaurar el vt?» es pura y vive en `Outcome` para poder
     // fijarla con una prueba; la restauración en sí toca /dev/tty0 y queda acá.

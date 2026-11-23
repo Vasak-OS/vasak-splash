@@ -94,6 +94,17 @@ impl DrmBackend {
             framebuffer,
         })
     }
+
+    /// Duplica el fd de la GPU para el hilo de cambio de VT. El dup comparte la
+    /// descripción de archivo, así que suelta/retoma el **mismo** master que el
+    /// lazo; un segundo `open` del nodo sería otra descripción —otro master— y no
+    /// serviría.
+    pub fn clone_card_fd(&self) -> io::Result<std::os::unix::io::OwnedFd> {
+        self.card
+            .0
+            .try_clone()
+            .map(std::os::unix::io::OwnedFd::from)
+    }
 }
 
 impl Backend for DrmBackend {

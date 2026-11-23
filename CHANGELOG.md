@@ -2,6 +2,15 @@
 
 Todas las novedades de este repositorio, por paquete.
 
+## vasak-splash 0.2.0
+
+- El splash ahora coopera con el cambio de consola (VT): pone el vt en
+  `VT_PROCESS` y, en cada cambio, suelta el master del DRM antes de ceder la
+  pantalla y lo retoma al volver. Sin esto, mientras el splash estaba arriba
+  ningún TTY se dibujaba —se perdía el acceso a la consola—.
+- El logo embebido es el de VasakOS (el lince), no el de Tauri que venía por
+  error en el asset.
+
 ## vasak-splash 0.1.0
 
 Primera versión. El splash de arranque propio de VasakOS, Fase 1: el hueco
