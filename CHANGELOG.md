@@ -10,8 +10,10 @@ Todas las novedades de este repositorio, por paquete.
   ningún TTY se dibujaba —se perdía el acceso a la consola—. La consola se fija a
   su propio VT (no al flotante `/dev/tty0`), así que restaurar el modo texto y el
   `VT_SETMODE` caen sobre el VT del splash aunque el usuario haya cambiado de
-  consola; y un redibujo que quedó viejo tras otro cambio de VT se descarta en vez
-  de volver a tomar el master y robarle la pantalla al getty entrante.
+  consola —best-effort: si `VT_GETSTATE` falla, se cae a `/dev/tty0` y la
+  restauración puede volver a quedar sobre el VT activo—; y un redibujo que quedó
+  viejo tras otro cambio de VT se descarta en vez de volver a tomar el master y
+  robarle la pantalla al getty entrante.
 - El logo embebido es el de VasakOS (el lince), no el de Tauri que venía por
   error en el asset.
 
