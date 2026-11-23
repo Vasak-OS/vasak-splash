@@ -114,21 +114,26 @@ fn draw<B: Backend>(backend: &mut B, background: u32) {
 
 /// Con el master **ya tomado** (por el `acquire` del arranque o por el
 /// `set_master` del hilo de VT al volver a la consola), dibuja y publica, pero
-/// sólo si seguimos al frente; si no, suelta el master y no pinta. Es el segundo
-/// chequeo de `foreground`, el que cierra la carrera del cambio de VT: entre que
-/// el lazo vio la bandera en `true` y llega acá, el hilo de VT pudo bajarla y
-/// soltar el master, y pintar igual pondría el splash sobre el VT del getty
-/// entrante. Si ya no estamos al frente, soltamos. (Un `present` que corra justo
-/// después de un `Release` todavía más tardío falla sin master y no pinta nada,
-/// así que la ventana que queda es inofensiva.)
-fn present_or_yield<B: Backend>(backend: &mut B, background: u32, foreground: &AtomicBool) {
+/// sólo si seguimos al frente. Es el segundo chequeo de `foreground`, el que cierra
+/// la carrera del cambio de VT: entre que el lazo vio la bandera en `true` y llega
+/// acá, el hilo de VT pudo bajarla y soltar el master, y pintar igual pondría el
+/// splash sobre el VT del getty entrante. (Un `present` que corra justo después de
+/// un `Release` todavía más tardío falla sin master y no pinta nada, así que la
+/// ventana que queda es inofensiva.)
+///
+/// Si ya no estamos al frente, no hace nada: **no suelta el master**. El dueño de
+/// soltarlo en un cambio de VT es el hilo (su `drop_master` en `Release`), y el fd
+/// del hilo es un dup del del lazo —comparten el mismo master—, así que cuando la
+/// bandera está en `false` el master ya lo soltó el hilo. Si el lazo lo soltara
+/// acá, podría pisar un `set_master` que el hilo acabara de hacer al volver (el
+/// master es compartido), y el redibujo siguiente se quedaría sin master. El lazo
+/// sólo suelta el master en su salida final (`Handoff`/`TimedOut`).
+fn present_if_foreground<B: Backend>(backend: &mut B, background: u32, foreground: &AtomicBool) {
     if foreground.load(Ordering::Acquire) {
         draw(backend, background);
         // Si el `present` falla no hay nada mejor que reintentar en el próximo
         // ciclo; el buffer ya está dibujado, así que no hay parpadeo.
         let _ = backend.present();
-    } else {
-        backend.release();
     }
 }
 
@@ -152,10 +157,11 @@ where
         return Outcome::GaveUp;
     }
 
-    // El primer dibujo pasa por el mismo chequeo que el redibujo: entre que se
-    // instaló el hilo de VT y tomamos el master (con reintentos), un cambio de VT
-    // pudo soltarlo, y presentar igual pondría el splash sobre el getty entrante.
-    present_or_yield(backend, background, foreground);
+    // El primer dibujo pasa por el mismo chequeo que el redibujo. En el arranque
+    // (initramfs) todavía no hay otra consola a la que cambiar, así que la bandera
+    // está en `true`; el chequeo cubre el caso raro de un cambio de VT entre que se
+    // instaló el hilo y tomamos el master.
+    present_if_foreground(backend, background, foreground);
 
     loop {
         match timeout.checked_sub(clock.elapsed()) {
@@ -176,12 +182,12 @@ where
                 // `acquire` acá, y un `Resume` viejo —otro cambio de VT soltó el
                 // master en el medio— lo descarta el guard, o si se coló, su
                 // `present` sin master falla solo. El guard es el chequeo barato;
-                // `present_or_yield` vuelve a mirar la bandera antes de pintar.
+                // `present_if_foreground` vuelve a mirar la bandera antes de pintar.
                 // shortcut: la Fase 2 (hueco greeter→compositor) necesitará re-tomar
                 // el master acá, porque ahí lo soltó el compositor y no el hilo de
                 // VT; se agrega cuando ese hueco se cablee de verdad.
                 Some(Command::Resume) if foreground.load(Ordering::Acquire) => {
-                    present_or_yield(backend, background, foreground);
+                    present_if_foreground(backend, background, foreground);
                 }
                 // `Resume` viejo (ya no estamos al frente): descartarlo.
                 Some(Command::Resume) => {}
@@ -352,10 +358,22 @@ mod tests {
     }
 
     #[test]
-    fn si_ya_no_estamos_al_frente_al_arrancar_se_cede_el_master_sin_dibujar() {
+    fn si_no_estamos_al_frente_al_arrancar_no_dibuja_ni_suelta_el_master() {
+        // Soltar en un cambio de VT es cosa del hilo de VT: el lazo no lo pisa.
+        // Sólo queda el `Release` del `Quit`.
         let (outcome, events) = correr(false, false, vec![Command::Quit]);
         assert_eq!(outcome, Outcome::Handoff);
-        assert_eq!(events, vec![Event::Acquire, Event::Release, Event::Release]);
+        assert_eq!(events, vec![Event::Acquire, Event::Release]);
+    }
+
+    #[test]
+    fn el_lazo_solo_suelta_el_master_en_la_salida_final() {
+        // Un `Resume` al frente redibuja pero no suelta: el único `Release` es el
+        // del `Quit`, y es el último evento.
+        let (_, events) = correr(true, false, vec![Command::Resume, Command::Quit]);
+        let releases = events.iter().filter(|e| **e == Event::Release).count();
+        assert_eq!(releases, 1, "eventos: {events:?}");
+        assert_eq!(events.last(), Some(&Event::Release));
     }
 
     #[test]
