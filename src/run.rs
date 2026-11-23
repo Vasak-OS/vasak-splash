@@ -112,14 +112,15 @@ fn draw<B: Backend>(backend: &mut B, background: u32) {
     });
 }
 
-/// Con el master **ya tomado**, dibuja y publica, pero sólo si seguimos al
-/// frente; si no, suelta el master y no pinta. Es el segundo chequeo de
-/// `foreground`, el que cierra la carrera del cambio de VT: entre que el lazo vio
-/// la bandera en `true` y tomó el master, el hilo de VT pudo bajarla y soltar el
-/// master, y sin esta segunda mirada re-tomaríamos el master y presentaríamos
-/// sobre el VT del getty entrante. Si ya no estamos al frente, soltamos. (Un
-/// `present` que corra justo después de un `Release` todavía más tardío falla sin
-/// master y no pinta nada, así que la ventana que queda es inofensiva.)
+/// Con el master **ya tomado** (por el `acquire` del arranque o por el
+/// `set_master` del hilo de VT al volver a la consola), dibuja y publica, pero
+/// sólo si seguimos al frente; si no, suelta el master y no pinta. Es el segundo
+/// chequeo de `foreground`, el que cierra la carrera del cambio de VT: entre que
+/// el lazo vio la bandera en `true` y llega acá, el hilo de VT pudo bajarla y
+/// soltar el master, y pintar igual pondría el splash sobre el VT del getty
+/// entrante. Si ya no estamos al frente, soltamos. (Un `present` que corra justo
+/// después de un `Release` todavía más tardío falla sin master y no pinta nada,
+/// así que la ventana que queda es inofensiva.)
 fn present_or_yield<B: Backend>(backend: &mut B, background: u32, foreground: &AtomicBool) {
     if foreground.load(Ordering::Acquire) {
         draw(backend, background);
@@ -168,16 +169,18 @@ where
                     backend.release();
                     return Outcome::Handoff;
                 }
-                // Redibujar sólo si seguimos al frente. Un `Resume` lo encola el
-                // hilo de VT al volver a la consola, pero puede quedar viejo: si
-                // entre que se encoló y lo atendemos hubo otro cambio de VT, el
-                // master ya es de otro. El guard descarta la mayoría antes de tocar
-                // el DRM; `present_or_yield` vuelve a mirar la bandera DESPUÉS del
-                // `acquire`, porque el hilo pudo soltar el master en el medio, y en
-                // ese caso suelta en vez de robarle la pantalla al getty entrante.
-                // Fase 2: el entrante soltó el DRM; redibujamos y seguimos.
+                // Redibujar al volver a la consola, sin re-tomar el master: ya lo
+                // re-tomó el hilo de VT en el `Acquire` (su `set_master`) antes de
+                // encolar este `Resume`, así que el lazo sólo dibuja. Es la clave de
+                // que no se le robe la pantalla al getty: el lazo nunca hace
+                // `acquire` acá, y un `Resume` viejo —otro cambio de VT soltó el
+                // master en el medio— lo descarta el guard, o si se coló, su
+                // `present` sin master falla solo. El guard es el chequeo barato;
+                // `present_or_yield` vuelve a mirar la bandera antes de pintar.
+                // shortcut: la Fase 2 (hueco greeter→compositor) necesitará re-tomar
+                // el master acá, porque ahí lo soltó el compositor y no el hilo de
+                // VT; se agrega cuando ese hueco se cablee de verdad.
                 Some(Command::Resume) if foreground.load(Ordering::Acquire) => {
-                    let _ = backend.acquire();
                     present_or_yield(backend, background, foreground);
                 }
                 // `Resume` viejo (ya no estamos al frente): descartarlo.
@@ -247,22 +250,13 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct FakeBackend<'a> {
+    struct FakeBackend {
         events: Vec<Event>,
-        acquires: usize,
-        /// Simula al hilo de VT: en el acquire número N baja la bandera.
-        baja_en: Option<(&'a AtomicBool, usize)>,
     }
 
-    impl Backend for FakeBackend<'_> {
+    impl Backend for FakeBackend {
         fn acquire(&mut self) -> std::io::Result<()> {
             self.events.push(Event::Acquire);
-            self.acquires += 1;
-            if let Some((bandera, n)) = self.baja_en {
-                if self.acquires == n {
-                    bandera.store(false, Ordering::Release);
-                }
-            }
             Ok(())
         }
         fn release(&mut self) {
@@ -332,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn un_resume_al_frente_retoma_el_master_y_redibuja() {
+    fn un_resume_al_frente_redibuja_sin_retomar_el_master() {
         let (outcome, events) = correr(true, false, vec![Command::Resume, Command::Quit]);
         assert_eq!(outcome, Outcome::Handoff);
         assert_eq!(
@@ -341,7 +335,6 @@ mod tests {
                 Event::Acquire,
                 Event::Draw,
                 Event::Present,
-                Event::Acquire,
                 Event::Draw,
                 Event::Present,
                 Event::Release,
@@ -350,40 +343,12 @@ mod tests {
     }
 
     #[test]
-    fn si_el_master_se_suelta_durante_el_acquire_del_resume_no_se_dibuja_y_se_cede() {
-        // Al frente cuando el lazo evalúa el guard, pero el hilo de VT baja la
-        // bandera justo mientras se toma el master (el 2.º acquire).
-        let foreground = AtomicBool::new(true);
-        let mut backend = FakeBackend {
-            baja_en: Some((&foreground, 2)),
-            ..Default::default()
-        };
-        let mut source = Script {
-            ordenes: vec![Command::Resume, Command::Quit].into(),
-            baja_antes: None,
-        };
-        let outcome = run(
-            &mut backend,
-            &ZeroClock,
-            &mut source,
-            0,
-            Duration::from_secs(60),
-            &mut || {},
-            &foreground,
-        );
-        assert_eq!(outcome, Outcome::Handoff);
-        assert_eq!(
-            backend.events,
-            vec![
-                Event::Acquire,
-                Event::Draw,
-                Event::Present,
-                // El Resume: toma, ve la bandera baja y suelta, sin dibujar.
-                Event::Acquire,
-                Event::Release,
-                Event::Release,
-            ]
-        );
+    fn el_resume_nunca_toma_el_master_el_unico_acquire_es_el_del_arranque() {
+        // El master lo re-toma el hilo de VT antes de encolar el `Resume`: si el
+        // lazo lo tomara otra vez podría robarle la pantalla al VT entrante.
+        let (_, events) = correr(true, false, vec![Command::Resume, Command::Quit]);
+        let acquires = events.iter().filter(|e| **e == Event::Acquire).count();
+        assert_eq!(acquires, 1, "eventos: {events:?}");
     }
 
     #[test]
