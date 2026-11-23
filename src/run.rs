@@ -68,12 +68,19 @@ impl MasterGate {
         drop_master();
     }
 
-    /// El hilo de VT en `Acquire`: retoma el master y sube la bandera en una sola
-    /// sección crítica, excluyente con `present_guarded`.
-    pub fn acquire_master(&self, set_master: impl FnOnce()) {
+    /// El hilo de VT en `Acquire`: intenta retomar el master bajo el lock
+    /// (excluyente con `present_guarded`) y **sólo si lo logra** sube la bandera.
+    /// Devuelve si se retomó: el llamador no debe pedir redibujo ni darse por al
+    /// frente cuando `SET_MASTER` falla (otro cliente lo tiene), porque presentar
+    /// sin master pondría el splash sobre el VT ajeno.
+    pub fn acquire_master(&self, set_master: impl FnOnce() -> bool) -> bool {
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        set_master();
-        self.foreground.store(true, Ordering::Release);
+        if set_master() {
+            self.foreground.store(true, Ordering::Release);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -451,7 +458,6 @@ mod master_gate_tests {
     use super::*;
     use std::sync::{mpsc, Arc};
     use std::thread;
-    use std::time::Duration;
 
     #[test]
     fn no_presenta_si_la_bandera_esta_en_false() {
@@ -483,7 +489,10 @@ mod master_gate_tests {
         assert!(!presentado, "sin master no se presenta");
 
         let mut retomado = false;
-        gate.acquire_master(|| retomado = true);
+        assert!(gate.acquire_master(|| {
+            retomado = true;
+            true
+        }));
         assert!(retomado);
         assert!(gate.is_foreground());
 
@@ -491,42 +500,78 @@ mod master_gate_tests {
         assert!(presentado, "tras retomar se vuelve a presentar");
     }
 
+    #[test]
+    fn retomar_con_exito_sube_la_bandera() {
+        let gate = MasterGate::new(true);
+        gate.release_master(|| {});
+        assert!(!gate.is_foreground());
+        assert!(gate.acquire_master(|| true));
+        assert!(gate.is_foreground());
+    }
+
+    #[test]
+    fn si_set_master_falla_no_se_sube_la_bandera_ni_se_presenta() {
+        // SET_MASTER con EBUSY: otro cliente tiene el master.
+        let gate = MasterGate::new(true);
+        gate.release_master(|| {});
+        assert!(!gate.acquire_master(|| false));
+        assert!(!gate.is_foreground(), "no hay que darse por al frente");
+
+        let mut presentado = false;
+        gate.present_guarded(|| presentado = true);
+        assert!(!presentado, "sin master no se redibuja");
+    }
+
     /// Un `present` nunca debe ver el master suelto aunque el hilo de VT intente
-    /// soltarlo justo mientras corre. Handshake determinista: el `present` avisa
-    /// que entró (y por lo tanto tiene el lock); recién entonces otro hilo llama a
-    /// `release_master`, que debe quedar bloqueado hasta que el `present` termine.
-    /// El `present` espera un rato a que el release termine: con el lock correcto
-    /// nunca termina y vence el plazo (sólo demora la prueba); sin el lock termina
-    /// al instante y el `present` ve el master suelto.
+    /// soltarlo justo mientras corre. Handshake bloqueante, sin plazos: el `present`
+    /// avisa que tiene el lock (B); el hilo de VT espera ese aviso, avisa que va a
+    /// soltar (A) y llama a `release_master`. El `present` espera A, o sea que sabe
+    /// que el hilo ya está en la puerta del release (si nunca corre, la prueba se
+    /// cuelga y falla, no pasa en falso). Con el lock correcto el release no puede
+    /// completarse mientras el `present` lo tiene; sin el lock, se completa solo.
     #[test]
     fn un_present_nunca_ve_el_master_suelto_con_un_release_en_pleno_present() {
         let gate = Arc::new(MasterGate::new(true));
         let master = Arc::new(AtomicBool::new(true));
-        let (entro_tx, entro_rx) = mpsc::channel::<()>();
-        let (suelto_tx, suelto_rx) = mpsc::channel::<()>();
+        let release_hecho = Arc::new(AtomicBool::new(false));
+        let (tiene_lock_tx, tiene_lock_rx) = mpsc::channel::<()>();
+        let (voy_a_soltar_tx, voy_a_soltar_rx) = mpsc::channel::<()>();
 
         let vt = {
-            let (gate, master) = (gate.clone(), master.clone());
+            let (gate, master, release_hecho) =
+                (gate.clone(), master.clone(), release_hecho.clone());
             thread::spawn(move || {
-                entro_rx.recv().unwrap();
-                gate.release_master(|| master.store(false, Ordering::SeqCst));
-                suelto_tx.send(()).unwrap();
+                tiene_lock_rx.recv().unwrap();
+                voy_a_soltar_tx.send(()).unwrap();
+                gate.release_master(|| {
+                    release_hecho.store(true, Ordering::SeqCst);
+                    master.store(false, Ordering::SeqCst);
+                });
             })
         };
 
         let mut corrio = false;
-        let mut visto_suelto = false;
+        let mut master_visto = false;
+        let mut release_visto = true;
         gate.present_guarded(|| {
             corrio = true;
-            entro_tx.send(()).unwrap();
-            let _ = suelto_rx.recv_timeout(Duration::from_millis(300));
-            visto_suelto = !master.load(Ordering::SeqCst);
+            tiene_lock_tx.send(()).unwrap();
+            voy_a_soltar_rx.recv().unwrap();
+            // Le damos lugar al hilo de VT para que llegue a bloquearse en el lock
+            // (o, sin lock, para que suelte el master).
+            for _ in 0..1000 {
+                thread::yield_now();
+            }
+            master_visto = master.load(Ordering::SeqCst);
+            release_visto = release_hecho.load(Ordering::SeqCst);
         });
         vt.join().unwrap();
 
         assert!(corrio, "el present en primer plano tiene que correr");
-        assert!(!visto_suelto, "el master se soltó en pleno present");
+        assert!(master_visto, "el master se soltó en pleno present");
+        assert!(!release_visto, "el release se completó en pleno present");
         // El release esperó y recién después bajó la bandera y soltó el master.
+        assert!(release_hecho.load(Ordering::SeqCst));
         assert!(!gate.is_foreground());
         assert!(!master.load(Ordering::SeqCst));
     }

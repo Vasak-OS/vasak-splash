@@ -115,14 +115,12 @@ pub fn action_for_signal(signo: i32) -> VtAction {
 /// `VT_GETSTATE`). `signalfd` puede entregar un `SIGUSR2` que quedó viejo —incluso
 /// fuera del orden en que el kernel lo generó, tras un `SIGUSR1`—: reclamar a
 /// ciegas tomaría el master con otro VT al frente y le robaría la pantalla al
-/// getty. Si no se pudo leer alguno de los dos VT, se sigue el camino best-effort
-/// del resto del módulo y se reclama. Pura a propósito, para fijarla con una
-/// prueba; el `VT_GETSTATE` en sí queda en `vt_active`.
+/// getty. Si no se pudo leer alguno de los dos VT, **no** reclama: sin confirmar
+/// que nuestro VT está al frente, tomar el master es el mismo riesgo de robarle la
+/// pantalla al getty, y un redibujo perdido pesa menos que eso. Pura a propósito,
+/// para fijarla con una prueba; el `VT_GETSTATE` en sí queda en `vt_active`.
 pub fn should_reclaim(our_vt: Option<u16>, active: Option<u16>) -> bool {
-    match (our_vt, active) {
-        (Some(nuestro), Some(activo)) => nuestro == activo,
-        _ => true,
-    }
+    matches!((our_vt, active), (Some(nuestro), Some(activo)) if nuestro == activo)
 }
 
 /// El conjunto de señales de cambio de VT (`SIGUSR1`, `SIGUSR2`).
@@ -211,16 +209,16 @@ pub fn install(
                 }
                 VtAction::Acquire => {
                     reldisp(tty, VT_ACKACQ);
-                    // Sólo reclamar el master si nuestro VT sigue siendo el activo:
-                    // un `SIGUSR2` viejo (signalfd puede entregarlo fuera del orden en
-                    // que el kernel lo generó, tras un `SIGUSR1`) llegaría con otro VT
-                    // al frente, y tomar el master ahí le robaría la pantalla al getty.
-                    if should_reclaim(our_vt, vt_active(tty)) {
-                        // Retomar el master y subir la bandera en una sola sección
-                        // crítica (bajo el lock), excluyente con el `present` del lazo.
-                        // Se sube la bandera antes de pedir el redibujo para que el lazo
-                        // no lo descarte por el chequeo barato.
-                        gate.acquire_master(|| set_master(card_fd));
+                    // Reclamar el master sólo si (1) nuestro VT sigue siendo el activo
+                    // —un `SIGUSR2` viejo, que signalfd puede entregar fuera del orden
+                    // en que el kernel lo generó tras un `SIGUSR1`, llegaría con otro VT
+                    // al frente— y (2) `SET_MASTER` de verdad funcionó. Sólo entonces
+                    // pedir el redibujo: `acquire_master` ya subió la bandera, bajo el
+                    // lock, nada más porque lo tomamos. Pedir `Resume` sin master haría
+                    // que el lazo presente sobre un VT ajeno.
+                    if should_reclaim(our_vt, vt_active(tty))
+                        && gate.acquire_master(|| set_master(card_fd))
+                    {
                         // El lazo redibuja al recibir Resume (reusa el hueco Fase 2).
                         // Si el lazo ya terminó, el canal está cerrado: nada que hacer.
                         if tx.send(Command::Resume).is_err() {
@@ -278,10 +276,11 @@ fn drop_master(fd: RawFd) {
     }
 }
 
-fn set_master(fd: RawFd) {
-    unsafe {
-        libc::ioctl(fd, DRM_IOCTL_SET_MASTER, 0);
-    }
+/// Intenta tomar el master (`SET_MASTER`). Devuelve si lo logró: puede fallar con
+/// `EBUSY` si otro cliente lo tiene, y en ese caso el llamador no debe darse por
+/// al frente ni redibujar.
+fn set_master(fd: RawFd) -> bool {
+    unsafe { libc::ioctl(fd, DRM_IOCTL_SET_MASTER, 0) >= 0 }
 }
 
 /// El VT activo ahora mismo (`VT_GETSTATE`), o `None` si el ioctl falla.
@@ -326,17 +325,18 @@ mod tests {
     }
 
     #[test]
-    fn sin_saber_nuestro_vt_se_reclama_el_master() {
-        assert!(should_reclaim(None, Some(2)));
+    fn sin_saber_nuestro_vt_no_se_reclama_el_master() {
+        assert!(!should_reclaim(None, Some(2)));
     }
 
     #[test]
-    fn sin_saber_el_vt_activo_se_reclama_el_master() {
-        assert!(should_reclaim(Some(1), None));
+    fn sin_saber_el_vt_activo_no_se_reclama_el_master() {
+        // Sin confirmar el VT activo no se le roba la pantalla al getty.
+        assert!(!should_reclaim(Some(1), None));
     }
 
     #[test]
-    fn sin_saber_ninguno_de_los_dos_vt_se_reclama_el_master() {
-        assert!(should_reclaim(None, None));
+    fn sin_saber_ninguno_de_los_dos_vt_no_se_reclama_el_master() {
+        assert!(!should_reclaim(None, None));
     }
 }
