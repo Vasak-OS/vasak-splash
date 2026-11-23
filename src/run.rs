@@ -449,9 +449,9 @@ mod tests {
 #[cfg(test)]
 mod master_gate_tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::{Arc, Barrier};
+    use std::sync::{mpsc, Arc};
     use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn no_presenta_si_la_bandera_esta_en_false() {
@@ -491,52 +491,43 @@ mod master_gate_tests {
         assert!(presentado, "tras retomar se vuelve a presentar");
     }
 
-    /// Un `present` nunca debe ver el master suelto, aunque el hilo de VT lo
-    /// suelte y lo retome a la vez. Se ensancha la ventana con `yield_now` dentro
-    /// del `present` (y del `drop_master`) para que, sin el lock, la violación
-    /// aparezca en cada corrida y no sólo de vez en cuando.
+    /// Un `present` nunca debe ver el master suelto aunque el hilo de VT intente
+    /// soltarlo justo mientras corre. Handshake determinista: el `present` avisa
+    /// que entró (y por lo tanto tiene el lock); recién entonces otro hilo llama a
+    /// `release_master`, que debe quedar bloqueado hasta que el `present` termine.
+    /// El `present` espera un rato a que el release termine: con el lock correcto
+    /// nunca termina y vence el plazo (sólo demora la prueba); sin el lock termina
+    /// al instante y el `present` ve el master suelto.
     #[test]
-    fn un_present_nunca_ve_el_master_suelto_con_soltar_y_retomar_concurrentes() {
-        const ITERACIONES: usize = 2000;
+    fn un_present_nunca_ve_el_master_suelto_con_un_release_en_pleno_present() {
         let gate = Arc::new(MasterGate::new(true));
         let master = Arc::new(AtomicBool::new(true));
-        let violaciones = Arc::new(AtomicUsize::new(0));
-        let presentados = Arc::new(AtomicUsize::new(0));
-        let barrera = Arc::new(Barrier::new(2));
+        let (entro_tx, entro_rx) = mpsc::channel::<()>();
+        let (suelto_tx, suelto_rx) = mpsc::channel::<()>();
 
         let vt = {
-            let (gate, master, barrera) = (gate.clone(), master.clone(), barrera.clone());
+            let (gate, master) = (gate.clone(), master.clone());
             thread::spawn(move || {
-                for _ in 0..ITERACIONES {
-                    barrera.wait();
-                    gate.release_master(|| {
-                        thread::yield_now();
-                        master.store(false, Ordering::SeqCst);
-                    });
-                    thread::yield_now();
-                    gate.acquire_master(|| master.store(true, Ordering::SeqCst));
-                }
+                entro_rx.recv().unwrap();
+                gate.release_master(|| master.store(false, Ordering::SeqCst));
+                suelto_tx.send(()).unwrap();
             })
         };
 
-        for _ in 0..ITERACIONES {
-            barrera.wait();
-            for _ in 0..4 {
-                gate.present_guarded(|| {
-                    presentados.fetch_add(1, Ordering::SeqCst);
-                    let mut visto_suelto = !master.load(Ordering::SeqCst);
-                    thread::yield_now();
-                    visto_suelto |= !master.load(Ordering::SeqCst);
-                    if visto_suelto {
-                        violaciones.fetch_add(1, Ordering::SeqCst);
-                    }
-                });
-            }
-        }
+        let mut corrio = false;
+        let mut visto_suelto = false;
+        gate.present_guarded(|| {
+            corrio = true;
+            entro_tx.send(()).unwrap();
+            let _ = suelto_rx.recv_timeout(Duration::from_millis(300));
+            visto_suelto = !master.load(Ordering::SeqCst);
+        });
         vt.join().unwrap();
 
-        assert_eq!(violaciones.load(Ordering::SeqCst), 0);
-        assert!(presentados.load(Ordering::SeqCst) > 0);
-        assert!(gate.is_foreground() && master.load(Ordering::SeqCst));
+        assert!(corrio, "el present en primer plano tiene que correr");
+        assert!(!visto_suelto, "el master se soltó en pleno present");
+        // El release esperó y recién después bajó la bandera y soltó el master.
+        assert!(!gate.is_foreground());
+        assert!(!master.load(Ordering::SeqCst));
     }
 }

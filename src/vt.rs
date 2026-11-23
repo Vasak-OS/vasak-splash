@@ -110,6 +110,21 @@ pub fn action_for_signal(signo: i32) -> VtAction {
     }
 }
 
+/// Si al recibir un `acqsig` hay que reclamar el master: sólo cuando nuestro VT
+/// (`our_vt`, resuelto en el arranque) sigue siendo el activo (`active`, de
+/// `VT_GETSTATE`). `signalfd` puede entregar un `SIGUSR2` que quedó viejo —incluso
+/// fuera del orden en que el kernel lo generó, tras un `SIGUSR1`—: reclamar a
+/// ciegas tomaría el master con otro VT al frente y le robaría la pantalla al
+/// getty. Si no se pudo leer alguno de los dos VT, se sigue el camino best-effort
+/// del resto del módulo y se reclama. Pura a propósito, para fijarla con una
+/// prueba; el `VT_GETSTATE` en sí queda en `vt_active`.
+pub fn should_reclaim(our_vt: Option<u16>, active: Option<u16>) -> bool {
+    match (our_vt, active) {
+        (Some(nuestro), Some(activo)) => nuestro == activo,
+        _ => true,
+    }
+}
+
 /// El conjunto de señales de cambio de VT (`SIGUSR1`, `SIGUSR2`).
 fn switch_sigset() -> libc::sigset_t {
     unsafe {
@@ -165,6 +180,9 @@ pub fn install(
         // retoma el master, que es por descripción de archivo (el dup comparte
         // la del lazo, así que afecta al mismo master).
         let card_fd = card.as_raw_fd();
+        // Nuestro VT, resuelto mientras el splash está al frente (en el arranque),
+        // para después descartar un `SIGUSR2` viejo que llegaría con otro VT activo.
+        let our_vt = vt_active(tty);
         let size = std::mem::size_of::<libc::signalfd_siginfo>();
         let mut info: libc::signalfd_siginfo = unsafe { std::mem::zeroed() };
         loop {
@@ -193,15 +211,21 @@ pub fn install(
                 }
                 VtAction::Acquire => {
                     reldisp(tty, VT_ACKACQ);
-                    // Retomar el master y subir la bandera en una sola sección crítica
-                    // (bajo el lock), excluyente con el `present` del lazo. Se sube la
-                    // bandera antes de pedir el redibujo para que el lazo no lo
-                    // descarte por el chequeo barato.
-                    gate.acquire_master(|| set_master(card_fd));
-                    // El lazo redibuja al recibir Resume (reusa el hueco Fase 2).
-                    // Si el lazo ya terminó, el canal está cerrado: nada que hacer.
-                    if tx.send(Command::Resume).is_err() {
-                        break;
+                    // Sólo reclamar el master si nuestro VT sigue siendo el activo:
+                    // un `SIGUSR2` viejo (signalfd puede entregarlo fuera del orden en
+                    // que el kernel lo generó, tras un `SIGUSR1`) llegaría con otro VT
+                    // al frente, y tomar el master ahí le robaría la pantalla al getty.
+                    if should_reclaim(our_vt, vt_active(tty)) {
+                        // Retomar el master y subir la bandera en una sola sección
+                        // crítica (bajo el lock), excluyente con el `present` del lazo.
+                        // Se sube la bandera antes de pedir el redibujo para que el lazo
+                        // no lo descarte por el chequeo barato.
+                        gate.acquire_master(|| set_master(card_fd));
+                        // El lazo redibuja al recibir Resume (reusa el hueco Fase 2).
+                        // Si el lazo ya terminó, el canal está cerrado: nada que hacer.
+                        if tx.send(Command::Resume).is_err() {
+                            break;
+                        }
                     }
                 }
                 VtAction::Ignore => {}
@@ -260,6 +284,15 @@ fn set_master(fd: RawFd) {
     }
 }
 
+/// El VT activo ahora mismo (`VT_GETSTATE`), o `None` si el ioctl falla.
+fn vt_active(tty: RawFd) -> Option<u16> {
+    let mut st: VtStat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::ioctl(tty, VT_GETSTATE, &mut st) } < 0 {
+        return None;
+    }
+    Some(st.v_active)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,5 +312,31 @@ mod tests {
         for signo in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT, 0, -1] {
             assert_eq!(action_for_signal(signo), VtAction::Ignore, "signo {signo}");
         }
+    }
+
+    #[test]
+    fn con_nuestro_vt_al_frente_se_reclama_el_master() {
+        assert!(should_reclaim(Some(1), Some(1)));
+    }
+
+    #[test]
+    fn con_otro_vt_al_frente_no_se_reclama_el_master() {
+        // Un SIGUSR2 viejo llega con otro VT activo: reclamar le robaría la pantalla.
+        assert!(!should_reclaim(Some(1), Some(2)));
+    }
+
+    #[test]
+    fn sin_saber_nuestro_vt_se_reclama_el_master() {
+        assert!(should_reclaim(None, Some(2)));
+    }
+
+    #[test]
+    fn sin_saber_el_vt_activo_se_reclama_el_master() {
+        assert!(should_reclaim(Some(1), None));
+    }
+
+    #[test]
+    fn sin_saber_ninguno_de_los_dos_vt_se_reclama_el_master() {
+        assert!(should_reclaim(None, None));
     }
 }
