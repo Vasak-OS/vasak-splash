@@ -11,10 +11,71 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::control::Command;
 use crate::{geometry, logo, render};
+
+/// Serializa el master del DRM entre el lazo —que presenta— y el hilo de VT —que
+/// lo suelta en un cambio de consola y lo retoma al volver—.
+///
+/// La carrera que cierra: el `present` del lazo es un `SETCRTC`, cuya autorización
+/// (el chequeo de master) la hace el kernel *antes* de ejecutar el ioctl. Sin
+/// serializar, el lazo puede ver la bandera en `true`, y entre eso y el `present`
+/// el hilo de VT baja la bandera y suelta el master; el scanout del splash podría
+/// entonces caer sobre el VT entrante. El lock lo vuelve imposible: el lazo
+/// presenta con el lock tomado, y el hilo suelta/retoma el master con el mismo
+/// lock, así que un `present` corre entero bajo el master o queda excluido hasta
+/// después de retomarlo. La bandera dice si seguimos al frente; el lock garantiza
+/// que el «chequear y presentar» sea atómico respecto del «bajar la bandera y
+/// soltar el master».
+pub struct MasterGate {
+    foreground: AtomicBool,
+    lock: Mutex<()>,
+}
+
+impl MasterGate {
+    pub fn new(foreground: bool) -> Self {
+        MasterGate {
+            foreground: AtomicBool::new(foreground),
+            lock: Mutex::new(()),
+        }
+    }
+
+    /// Chequeo barato de si seguimos al frente, sin tomar el lock, para descartar
+    /// un `Resume` viejo. El chequeo que cierra la carrera es el de `present`.
+    pub fn is_foreground(&self) -> bool {
+        self.foreground.load(Ordering::Acquire)
+    }
+
+    /// Con el master **ya tomado**, corre `present` sólo si seguimos al frente, con
+    /// el lock tomado para que el hilo de VT no pueda soltar el master en el medio.
+    /// Si un envenenamiento dejó el lock tomado por un pánico, se recupera el guard:
+    /// trabar el splash dejaría la pantalla colgada, que es peor.
+    fn present_guarded(&self, present: impl FnOnce()) {
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        if self.foreground.load(Ordering::Acquire) {
+            present();
+        }
+    }
+
+    /// El hilo de VT en `Release`: baja la bandera y suelta el master en una sola
+    /// sección crítica, excluyente con `present_guarded`.
+    pub fn release_master(&self, drop_master: impl FnOnce()) {
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.foreground.store(false, Ordering::Release);
+        drop_master();
+    }
+
+    /// El hilo de VT en `Acquire`: retoma el master y sube la bandera en una sola
+    /// sección crítica, excluyente con `present_guarded`.
+    pub fn acquire_master(&self, set_master: impl FnOnce()) {
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        set_master();
+        self.foreground.store(true, Ordering::Release);
+    }
+}
 
 /// Cómo terminó el splash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,12 +175,9 @@ fn draw<B: Backend>(backend: &mut B, background: u32) {
 
 /// Con el master **ya tomado** (por el `acquire` del arranque o por el
 /// `set_master` del hilo de VT al volver a la consola), dibuja y publica, pero
-/// sólo si seguimos al frente. Es el segundo chequeo de `foreground`, el que cierra
-/// la carrera del cambio de VT: entre que el lazo vio la bandera en `true` y llega
-/// acá, el hilo de VT pudo bajarla y soltar el master, y pintar igual pondría el
-/// splash sobre el VT del getty entrante. (Un `present` que corra justo después de
-/// un `Release` todavía más tardío falla sin master y no pinta nada, así que la
-/// ventana que queda es inofensiva.)
+/// sólo si seguimos al frente, todo bajo el lock de `MasterGate` para que el hilo
+/// de VT no pueda soltar el master entre el chequeo y el `present`. Pintar sin
+/// master pondría el splash sobre el VT del getty entrante; el lock lo impide.
 ///
 /// Si ya no estamos al frente, no hace nada: **no suelta el master**. El dueño de
 /// soltarlo en un cambio de VT es el hilo (su `drop_master` en `Release`), y el fd
@@ -128,13 +186,13 @@ fn draw<B: Backend>(backend: &mut B, background: u32) {
 /// acá, podría pisar un `set_master` que el hilo acabara de hacer al volver (el
 /// master es compartido), y el redibujo siguiente se quedaría sin master. El lazo
 /// sólo suelta el master en su salida final (`Handoff`/`TimedOut`).
-fn present_if_foreground<B: Backend>(backend: &mut B, background: u32, foreground: &AtomicBool) {
-    if foreground.load(Ordering::Acquire) {
+fn present_if_foreground<B: Backend>(backend: &mut B, background: u32, gate: &MasterGate) {
+    gate.present_guarded(|| {
         draw(backend, background);
         // Si el `present` falla no hay nada mejor que reintentar en el próximo
         // ciclo; el buffer ya está dibujado, así que no hay parpadeo.
         let _ = backend.present();
-    }
+    });
 }
 
 /// El lazo del splash. Toma el DRM, dibuja, publica y espera el `quit` o el
@@ -146,7 +204,7 @@ pub fn run<B, C, S>(
     background: u32,
     timeout: Duration,
     backoff: &mut dyn FnMut(),
-    foreground: &AtomicBool,
+    gate: &MasterGate,
 ) -> Outcome
 where
     B: Backend,
@@ -161,7 +219,7 @@ where
     // (initramfs) todavía no hay otra consola a la que cambiar, así que la bandera
     // está en `true`; el chequeo cubre el caso raro de un cambio de VT entre que se
     // instaló el hilo y tomamos el master.
-    present_if_foreground(backend, background, foreground);
+    present_if_foreground(backend, background, gate);
 
     loop {
         match timeout.checked_sub(clock.elapsed()) {
@@ -186,8 +244,8 @@ where
                 // shortcut: la Fase 2 (hueco greeter→compositor) necesitará re-tomar
                 // el master acá, porque ahí lo soltó el compositor y no el hilo de
                 // VT; se agrega cuando ese hueco se cablee de verdad.
-                Some(Command::Resume) if foreground.load(Ordering::Acquire) => {
-                    present_if_foreground(backend, background, foreground);
+                Some(Command::Resume) if gate.is_foreground() => {
+                    present_if_foreground(backend, background, gate);
                 }
                 // `Resume` viejo (ya no estamos al frente): descartarlo.
                 Some(Command::Resume) => {}
@@ -286,14 +344,15 @@ mod tests {
 
     struct Script<'a> {
         ordenes: VecDeque<Command>,
-        /// Simula al hilo de VT: baja la bandera antes de entregar la primera orden
-        /// (un cambio de VT ocurrió después de encolar el `Resume`).
-        baja_antes: Option<&'a AtomicBool>,
+        /// Simula al hilo de VT: baja la bandera (soltando el master) antes de
+        /// entregar la primera orden —un cambio de VT ocurrió después de encolar el
+        /// `Resume`—.
+        baja_antes: Option<&'a MasterGate>,
     }
     impl CommandSource for Script<'_> {
         fn wait(&mut self, _timeout: Duration) -> Option<Command> {
-            if let Some(bandera) = self.baja_antes.take() {
-                bandera.store(false, Ordering::Release);
+            if let Some(gate) = self.baja_antes.take() {
+                gate.release_master(|| {});
             }
             // El guion siempre termina en `Quit`, así que nunca se agota.
             self.ordenes.pop_front()
@@ -302,11 +361,11 @@ mod tests {
 
     /// Corre el lazo con el guion dado y devuelve cómo terminó y qué hizo el backend.
     fn correr(foreground: bool, baja_antes: bool, guion: Vec<Command>) -> (Outcome, Vec<Event>) {
-        let bandera = AtomicBool::new(foreground);
+        let gate = MasterGate::new(foreground);
         let mut backend = FakeBackend::default();
         let mut source = Script {
             ordenes: guion.into(),
-            baja_antes: baja_antes.then_some(&bandera),
+            baja_antes: baja_antes.then_some(&gate),
         };
         let outcome = run(
             &mut backend,
@@ -315,7 +374,7 @@ mod tests {
             0,
             Duration::from_secs(60),
             &mut || {},
-            &bandera,
+            &gate,
         );
         (outcome, backend.events)
     }
@@ -384,5 +443,100 @@ mod tests {
         // consola queda en negro.
         assert!(Outcome::TimedOut.restores_text_mode());
         assert!(Outcome::GaveUp.restores_text_mode());
+    }
+}
+
+#[cfg(test)]
+mod master_gate_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    #[test]
+    fn no_presenta_si_la_bandera_esta_en_false() {
+        let gate = MasterGate::new(false);
+        let mut corrio = false;
+        gate.present_guarded(|| corrio = true);
+        assert!(!corrio);
+        assert!(!gate.is_foreground());
+    }
+
+    #[test]
+    fn presenta_si_la_bandera_esta_en_true() {
+        let gate = MasterGate::new(true);
+        let mut corrio = false;
+        gate.present_guarded(|| corrio = true);
+        assert!(corrio);
+    }
+
+    #[test]
+    fn soltar_baja_la_bandera_y_retomar_la_sube_y_permite_presentar() {
+        let gate = MasterGate::new(true);
+        let mut soltado = false;
+        gate.release_master(|| soltado = true);
+        assert!(soltado);
+        assert!(!gate.is_foreground());
+
+        let mut presentado = false;
+        gate.present_guarded(|| presentado = true);
+        assert!(!presentado, "sin master no se presenta");
+
+        let mut retomado = false;
+        gate.acquire_master(|| retomado = true);
+        assert!(retomado);
+        assert!(gate.is_foreground());
+
+        gate.present_guarded(|| presentado = true);
+        assert!(presentado, "tras retomar se vuelve a presentar");
+    }
+
+    /// Un `present` nunca debe ver el master suelto, aunque el hilo de VT lo
+    /// suelte y lo retome a la vez. Se ensancha la ventana con `yield_now` dentro
+    /// del `present` (y del `drop_master`) para que, sin el lock, la violación
+    /// aparezca en cada corrida y no sólo de vez en cuando.
+    #[test]
+    fn un_present_nunca_ve_el_master_suelto_con_soltar_y_retomar_concurrentes() {
+        const ITERACIONES: usize = 2000;
+        let gate = Arc::new(MasterGate::new(true));
+        let master = Arc::new(AtomicBool::new(true));
+        let violaciones = Arc::new(AtomicUsize::new(0));
+        let presentados = Arc::new(AtomicUsize::new(0));
+        let barrera = Arc::new(Barrier::new(2));
+
+        let vt = {
+            let (gate, master, barrera) = (gate.clone(), master.clone(), barrera.clone());
+            thread::spawn(move || {
+                for _ in 0..ITERACIONES {
+                    barrera.wait();
+                    gate.release_master(|| {
+                        thread::yield_now();
+                        master.store(false, Ordering::SeqCst);
+                    });
+                    thread::yield_now();
+                    gate.acquire_master(|| master.store(true, Ordering::SeqCst));
+                }
+            })
+        };
+
+        for _ in 0..ITERACIONES {
+            barrera.wait();
+            for _ in 0..4 {
+                gate.present_guarded(|| {
+                    presentados.fetch_add(1, Ordering::SeqCst);
+                    let mut visto_suelto = !master.load(Ordering::SeqCst);
+                    thread::yield_now();
+                    visto_suelto |= !master.load(Ordering::SeqCst);
+                    if visto_suelto {
+                        violaciones.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        }
+        vt.join().unwrap();
+
+        assert_eq!(violaciones.load(Ordering::SeqCst), 0);
+        assert!(presentados.load(Ordering::SeqCst) > 0);
+        assert!(gate.is_foreground() && master.load(Ordering::SeqCst));
     }
 }

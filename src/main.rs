@@ -20,11 +20,10 @@ mod vt;
 
 use std::os::unix::io::AsRawFd;
 use std::process::ExitCode;
-use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
-use run::Outcome;
+use run::{MasterGate, Outcome};
 
 /// Dónde busca el daemon su configuración. Si no está, valores por omisión.
 const CONFIG_PATH: &str = "/etc/vasak-splash.conf";
@@ -103,15 +102,15 @@ fn start() -> ExitCode {
 
     // Cooperar con el cambio de consola: sin esto el splash se queda con el master
     // del DRM y el vt en modo gráfico, así que mientras está arriba ningún TTY se
-    // dibuja —te quedás sin consola—. La bandera `foreground` la comparte el hilo
-    // de VT con el lazo para descartar los `Resume` viejos. Best-effort: si no hay
-    // consola real (p. ej. en desarrollo), el daemon sigue igual, sin cooperación.
-    let foreground = Arc::new(AtomicBool::new(true));
+    // dibuja —te quedás sin consola—. El `MasterGate` lo comparten el hilo de VT y
+    // el lazo: lleva la bandera de «al frente» (para descartar los `Resume` viejos)
+    // y serializa el master con el `present`. Best-effort: si no hay consola real
+    // (p. ej. en desarrollo), el daemon sigue igual, sin cooperación.
+    let gate = Arc::new(MasterGate::new(true));
     if let Some(tty) = &tty {
         match backend.clone_card_fd() {
             Ok(card_fd) => {
-                if let Err(err) = vt::install(tty.as_raw_fd(), card_fd, tx, Arc::clone(&foreground))
-                {
+                if let Err(err) = vt::install(tty.as_raw_fd(), card_fd, tx, Arc::clone(&gate)) {
                     eprintln!("vasak-splashd: sin cooperación de cambio de VT: {err}");
                 }
             }
@@ -133,7 +132,7 @@ fn start() -> ExitCode {
         config.background,
         config.timeout,
         &mut backoff,
-        &foreground,
+        &gate,
     );
 
     // Devolver el VT a modo automático antes de salir: el greeter y los gettys

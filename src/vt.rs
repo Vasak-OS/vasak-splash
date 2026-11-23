@@ -21,12 +21,12 @@
 use std::fs::OpenOptions;
 use std::io;
 use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::thread;
 
 use crate::control::Command;
+use crate::run::MasterGate;
 
 // <linux/vt.h>
 const VT_GETSTATE: libc::c_ulong = 0x5603;
@@ -135,17 +135,18 @@ pub fn block_switch_signals() {
 /// Pone el VT en `VT_PROCESS` (el kernel nos señala los cambios) y lanza el hilo
 /// que los atiende. `tty` es el fd de nuestra consola (el de `open_console`, fijo
 /// a nuestro VT); `card`, un dup del fd de la GPU para soltar/retomar el master;
-/// `tx`, el canal del lazo, por donde se pide el redibujo al volver; `foreground`,
-/// la bandera compartida con el lazo que dice si el splash está al frente, para
-/// que descarte los `Resume` que quedaron viejos tras otro cambio de consola. Si
-/// el `VT_SETMODE` falla (sin consola real, p. ej. en desarrollo), devuelve el
-/// error y el daemon sigue sin cooperación de VT —como el resto del camino de DRM,
-/// es best-effort—.
+/// `tx`, el canal del lazo, por donde se pide el redibujo al volver; `gate`, el
+/// `MasterGate` compartido con el lazo: por él se baja/sube la bandera —para que
+/// descarte los `Resume` viejos— y se suelta/retoma el master bajo el lock, de modo
+/// que un `present` del lazo no pueda colarse mientras el master está suelto. Si el
+/// `VT_SETMODE` falla (sin consola real, p. ej. en desarrollo), devuelve el error y
+/// el daemon sigue sin cooperación de VT —como el resto del camino de DRM, es
+/// best-effort—.
 pub fn install(
     tty: RawFd,
     card: OwnedFd,
     tx: Sender<Command>,
-    foreground: Arc<AtomicBool>,
+    gate: Arc<MasterGate>,
 ) -> io::Result<()> {
     set_process_mode(tty)?;
 
@@ -179,21 +180,24 @@ pub fn install(
             }
             match action_for_signal(info.ssi_signo as i32) {
                 VtAction::Release => {
-                    // Marcar que ya no estamos al frente ANTES de soltar el master:
-                    // así un `Resume` viejo que el lazo todavía no atendió se
-                    // descarta en vez de re-tomar el master y robarle la pantalla al
-                    // VT entrante. Después soltar el master, para que el kernel pueda
-                    // dar la pantalla al VT entrante (un getty en texto).
-                    foreground.store(false, Ordering::Release);
-                    drop_master(card_fd);
+                    // Bajar la bandera y soltar el master en una sola sección crítica
+                    // (bajo el lock de `gate`), excluyente con el `present` del lazo:
+                    // así un `present` no se cuela entre que bajamos la bandera y
+                    // soltamos el master —la ventana en que el scanout del splash
+                    // podía caer sobre el VT entrante—. Bajar la bandera primero hace,
+                    // además, que un `Resume` viejo que el lazo no atendió se descarte
+                    // en vez de robarle la pantalla al VT entrante. Recién después el
+                    // reldisp, para que el kernel dé la pantalla al getty entrante.
+                    gate.release_master(|| drop_master(card_fd));
                     reldisp(tty, VT_RELDISP_ALLOW);
                 }
                 VtAction::Acquire => {
                     reldisp(tty, VT_ACKACQ);
-                    set_master(card_fd);
-                    // Volvimos al frente: marcarlo antes de pedir el redibujo, para
-                    // que el lazo no lo descarte por el chequeo de arriba.
-                    foreground.store(true, Ordering::Release);
+                    // Retomar el master y subir la bandera en una sola sección crítica
+                    // (bajo el lock), excluyente con el `present` del lazo. Se sube la
+                    // bandera antes de pedir el redibujo para que el lazo no lo
+                    // descarte por el chequeo barato.
+                    gate.acquire_master(|| set_master(card_fd));
                     // El lazo redibuja al recibir Resume (reusa el hueco Fase 2).
                     // Si el lazo ya terminó, el canal está cerrado: nada que hacer.
                     if tx.send(Command::Resume).is_err() {
