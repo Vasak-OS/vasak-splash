@@ -16,12 +16,14 @@ mod logo;
 mod render;
 mod run;
 mod select;
+mod vt;
 
+use std::os::unix::io::AsRawFd;
 use std::process::ExitCode;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
-use run::Outcome;
+use run::{MasterGate, Outcome};
 
 /// Dónde busca el daemon su configuración. Si no está, valores por omisión.
 const CONFIG_PATH: &str = "/etc/vasak-splash.conf";
@@ -66,6 +68,11 @@ fn start() -> ExitCode {
         .map(|text| config::parse(&text))
         .unwrap_or_default();
 
+    // Bloquear las señales de cambio de VT antes de crear ningún hilo (el del
+    // socket incluido): tienen que llegar sólo por el signalfd del hilo de VT, no
+    // matar el proceso.
+    vt::block_switch_signals();
+
     let mut backend = match drm_backend::DrmBackend::open() {
         Ok(backend) => backend,
         Err(err) => {
@@ -76,13 +83,39 @@ fn start() -> ExitCode {
         }
     };
 
+    // La consola del splash, fijada a su propio VT (no al flotante `/dev/tty0`):
+    // con ella se restaura el modo texto y el `VT_SETMODE` aunque el usuario haya
+    // cambiado de consola. Se abre antes del socket para que el camino de fallo de
+    // abajo pueda devolverla a modo texto.
+    let tty = vt::open_console();
+
     let (tx, rx) = mpsc::channel();
-    if let Err(err) = control::serve(control::SOCKET_PATH, tx) {
+    if let Err(err) = control::serve(control::SOCKET_PATH, tx.clone()) {
         eprintln!("vasak-splashd: no se pudo abrir el socket de control: {err}");
         // `open()` ya dejó el vt en modo gráfico: sin nadie que dibuje, hay que
         // devolver la consola a modo texto.
-        drm_backend::set_text_mode();
+        if let Some(tty) = &tty {
+            drm_backend::set_text_mode(tty.as_raw_fd());
+        }
         return ExitCode::FAILURE;
+    }
+
+    // Cooperar con el cambio de consola: sin esto el splash se queda con el master
+    // del DRM y el vt en modo gráfico, así que mientras está arriba ningún TTY se
+    // dibuja —te quedás sin consola—. El `MasterGate` lo comparten el hilo de VT y
+    // el lazo: lleva la bandera de «al frente» (para descartar los `Resume` viejos)
+    // y serializa el master con el `present`. Best-effort: si no hay consola real
+    // (p. ej. en desarrollo), el daemon sigue igual, sin cooperación.
+    let gate = Arc::new(MasterGate::new(true));
+    if let Some(tty) = &tty {
+        match backend.clone_card_fd() {
+            Ok(card_fd) => {
+                if let Err(err) = vt::install(tty.as_raw_fd(), card_fd, tx, Arc::clone(&gate)) {
+                    eprintln!("vasak-splashd: sin cooperación de cambio de VT: {err}");
+                }
+            }
+            Err(err) => eprintln!("vasak-splashd: no se pudo duplicar el fd de la GPU: {err}"),
+        }
     }
 
     let clock = run::MonotonicClock::default();
@@ -99,12 +132,21 @@ fn start() -> ExitCode {
         config.background,
         config.timeout,
         &mut backoff,
+        &gate,
     );
 
+    // Devolver el VT a modo automático antes de salir: el greeter y los gettys
+    // tienen que poder cambiar de consola sin un daemon que ya no está.
+    if let Some(tty) = &tty {
+        vt::restore(tty.as_raw_fd());
+    }
+
     // La decisión «¿restaurar el vt?» es pura y vive en `Outcome` para poder
-    // fijarla con una prueba; la restauración en sí toca /dev/tty0 y queda acá.
+    // fijarla con una prueba; la restauración en sí toca el VT y queda acá.
     if outcome.restores_text_mode() {
-        drm_backend::set_text_mode();
+        if let Some(tty) = &tty {
+            drm_backend::set_text_mode(tty.as_raw_fd());
+        }
     }
 
     match outcome {

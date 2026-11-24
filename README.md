@@ -35,6 +35,7 @@ pruebas:
 | Protocolo de control | `src/control.rs` | parseo de las órdenes del socket |
 | El lazo | `src/run.rs` | tomar/soltar el DRM, dibujar, esperar el `quit` o el **temporizador de seguridad** (reloj inyectado) |
 | DRM real | `src/drm_backend.rs` | la implementación con drm-rs del rasgo `Backend` (no se prueba sin hardware) |
+| Cambio de VT | `src/vt.rs` | poner el vt en `VT_PROCESS` y soltar/retomar el master en cada cambio de consola (ioctls; sólo la decisión señal→acción se prueba) |
 
 El logo se rasteriza a RGBA crudo en `build.rs` desde `assets/logo.png` y se
 embebe con `include_bytes!`: en ejecución no se decodifica nada.
@@ -91,4 +92,13 @@ comprobar en VM y en equipo real:
 - que **no quede negro colgado**: reteniendo el `quit` a propósito, el
   temporizador tiene que retirar el splash;
 - que el handoff al greeter no parpadee (DROP_MASTER del saliente justo antes del
-  SET_MASTER del entrante; vt en modo gráfico de punta a punta).
+  SET_MASTER del entrante; vt en modo gráfico de punta a punta);
+- que la **cooperación con el cambio de VT** (`src/vt.rs`) funcione en consola
+  real: con el splash arriba, cambiar a otra consola (Ctrl+Alt+F2) tiene que
+  soltar el master y mostrar el getty, y volver tiene que retomarlo y redibujar;
+- que, **al vencer el temporizador o rendirse estando en otra consola**, se
+  restaure el modo texto del VT del splash y no del que esté al frente (la consola
+  se fija con `VT_GETSTATE`/`/dev/ttyN`, no con el flotante `/dev/tty0`), y que al
+  volver al VT del splash no quede ni negro ni en `VT_PROCESS` colgado;
+- que un **cambio de VT rápido de ida y vuelta** no deje al splash robándole la
+  pantalla al getty: el redibujo que quedó viejo tiene que descartarse.
