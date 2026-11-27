@@ -5,7 +5,7 @@
 # daemon del protocolo sólo agregaría ceremonia.
 [package]
 name = "vasak-splash"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 authors = ["Vasak Group", "Joaquin (Pato) Decima"]
 license = "GPL-3.0-or-later"
