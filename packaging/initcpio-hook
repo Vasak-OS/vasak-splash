@@ -3,6 +3,16 @@
 # arranque, en el orden del array de HOOKS (después de `kms`).
 
 run_hook() {
+    # Negro inmediato. Hasta el primer `present` del daemon, en pantalla sigue el
+    # framebuffer que dejó el firmware —en muchas máquinas, blanco—; el lazo evita
+    # a propósito un modeset en negro, así que ese blanco duraría todo el segundo
+    # que tarda en cargar. Limpiar /dev/fb0 a negro apenas `kms` entregó el driver
+    # (este hook corre después de `kms`) tapa el blanco sin tocar el scanout del
+    # daemon, que después pone su propio buffer. `cat` llena hasta ENOSPC y sale en
+    # error: esperado, por eso se descarta. Best-effort: sin emulación fbdev no hay
+    # /dev/fb0 y se omite. Se valida en VM/hardware, como el resto de este camino.
+    [ -w /dev/fb0 ] && cat /dev/zero > /dev/fb0 2>/dev/null
+
     # En segundo plano: el hook tiene que volver para que el arranque siga, y el
     # daemon se queda dibujando. Sobrevive al `switch_root` igual que plymouthd
     # —sus páginas ya están mapeadas— y se retira cuando el greeter le manda
